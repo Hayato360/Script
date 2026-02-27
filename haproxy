@@ -1,0 +1,137 @@
+#!/bin/bash
+
+# Update the system
+apt update -y && apt upgrade -y
+
+# Add HAProxy 2.7 repository
+add-apt-repository ppa:vbernat/haproxy-2.7 --yes
+
+# Install HAProxy 2.7
+apt install haproxy -y
+
+# Upgrade and update services
+apt upgrade -y
+apt update -y
+
+# Install dependencies for HAProxy Exporter
+apt install -y git ca-certificates gcc libc6-dev liblua5.3-dev libpcre3-dev libssl-dev libsystemd-dev make wget zlib1g-dev
+
+# Clone HAProxy Exporter repository
+git clone https://github.com/haproxy/haproxy.git
+
+# Compile HAProxy for Prometheus
+cd haproxy
+make TARGET=linux-glibc USE_LUA=1 USE_OPENSSL=1 USE_PCRE=1 USE_ZLIB=1 USE_SYSTEMD=1 USE_PROMEX=1
+make install-bin
+
+# Restart HAProxy
+systemctl stop haproxy
+cp /usr/local/sbin/haproxy /usr/sbin/haproxy
+systemctl start haproxy
+systemctl enable haproxy
+
+# Create a user for Node Exporter
+useradd -M -r -s /bin/false node_exporter
+
+# Download and install Node Exporter
+wget https://github.com/prometheus/node_exporter/releases/download/v1.0.1/node_exporter-1.0.1.linux-amd64.tar.gz
+tar xzf node_exporter-1.0.1.linux-amd64.tar.gz
+cp node_exporter-1.0.1.linux-amd64/node_exporter /usr/local/bin/
+chown node_exporter:node_exporter /usr/local/bin/node_exporter
+
+# Create a service file for Node Exporter
+cat <<EOF > /etc/systemd/system/node_exporter.service
+[Unit]
+Description=Prometheus Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Reload systemd and start Node Exporter service
+systemctl daemon-reload
+systemctl start node_exporter.service
+systemctl enable node_exporter.service
+
+# Display listening ports (Node Exporter runs on TCP port 9100)
+netstat -nltp
+
+# Prompt for the number of worker nodes
+read -p "Enter the number of worker nodes: " num_workers
+
+# Array to store worker IPs
+worker_ips=()
+
+# Prompt for worker nodes' IP addresses
+for ((i=1; i<=num_workers; i++))
+do
+    read -p "Enter the IP address of worker-$i: " ip
+    worker_ips+=("$ip")
+done
+
+# Configure HAProxy
+cat <<EOF >> /etc/haproxy/haproxy.cfg
+#haproxy
+listen stats
+   bind *:8484
+   stats enable
+   stats uri /
+   #stats auth admin:K233Jf@w
+
+#Ingress
+frontend http-and-https
+   bind *:80
+   mode http
+   #http-request redirect scheme https unless { ssl_fc }
+   default_backend allservers
+
+backend allservers
+   mode http
+   balance roundrobin
+EOF
+
+# Add worker nodes to the backend
+for ((i=0; i<num_workers; i++))
+do
+    backend_line="   server worker-$((i+1)) ${worker_ips[i]}:30080 check"
+    echo "$backend_line" >> /etc/haproxy/haproxy.cfg
+done
+
+# Configure HTTPS frontend and backend
+cat <<EOF >> /etc/haproxy/haproxy.cfg
+
+#Ingress
+frontend https
+   bind *:443
+   mode tcp
+   #http-request redirect scheme https unless { ssl_fc }
+   default_backend allservers-https
+
+backend allservers-https
+   mode tcp
+   balance roundrobin
+EOF
+
+# Add worker nodes to the HTTPS backend
+for ((i=0; i<num_workers; i++))
+do
+    backend_line="   server worker-$((i+1)) ${worker_ips[i]}:30443 check"
+    echo "$backend_line" >> /etc/haproxy/haproxy.cfg
+done
+
+# Restart HAProxy to apply the changes
+systemctl restart haproxy
+
+# Display the updated HAProxy configuration
+cat /etc/haproxy/haproxy.cfg
+
+# Check the status of haproxy.service
+systemctl status haproxy.service

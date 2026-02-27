@@ -1,0 +1,76 @@
+#!/bin/bash
+
+communitystring=olsmonitor
+
+###### Worker Server ########
+
+read -p "Enter IP NFS :" ip_nfs
+
+#############################################################
+####################### update ##############################
+#############################################################
+
+echo "1.Update"
+Update()
+{
+        apt update -y
+        apt upgrade -y
+}
+Update > /dev/null 2>&1
+echo "Update success"
+
+###############################################################
+####################### install chrony ########################
+###############################################################
+
+echo "3.Install chrony"
+Chrony()
+{
+        timedatectl set-timezone Asia/Bangkok
+        apt install chrony -y
+        sed -i 's/pool/#pool/g'  /etc/chrony/chrony.conf
+        sed -i 's/#pool 2.ubuntu.#pool.ntp.org iburst maxsources 2/server clock.inet.co.th/g'  /etc/chrony/chrony.conf
+        systemctl restart chrony
+}
+Chrony > /dev/null 2>&1
+echo "Install chrony success"
+
+###############################################################
+######################### Swapoff #############################
+###############################################################
+
+echo "4.Swapoff"
+Swapoff()
+{
+        swapoff -a
+        sed -ri '/\sswap\s/s/^#?/#/' /etc/fstab
+}
+Swapoff > /dev/null 2>&1
+echo "Swapoff success"
+
+###############################################################
+######################## NFS Server ###########################
+###############################################################
+
+echo "5.Install NFS-common"
+NFS()
+{
+        apt install nfs-common -y
+}
+NFS > /dev/null 2>&1
+showmount -e $ip_nfs
+echo "Install NFS-common success"
+
+###############################################################
+######################### SNMP #############################
+###############################################################
+
+echo "6.SNMP"
+SNMP(){
+        apt install snmp snmpd -y
+        echo "rocommunity  $communitystring " >> /etc/snmp/snmpd.conf
+        sudo sed  -i 's|127.0.0.1|udp:161|g' /etc/snmp/snmpd.conf
+        systemctl restart snmpd
+}
+SNMP > /dev/null 2>&1
+echo "SNMP success"
