@@ -53,7 +53,7 @@ if [[ $(which docker) && $(docker --version) ]]; then
         echo -e "Docker already ${RED}installed${NC}"
 else
         echo "[DEBUG] Downloading and running docker install script..."
-        curl -s https://releases.rancher.com/install-docker/20.10.sh | sh
+        curl -s https://get.docker.com | sh
         if [ $? -ne 0 ]; then echo -e "${RED}[DEBUG] STEP 2 (Docker install) FAILED${NC}"; exit 1; fi
         echo "Install docker success"
 fi
