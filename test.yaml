@@ -1,0 +1,373 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-app
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-credentials
+  namespace: demo-app
+type: Opaque
+stringData:
+  POSTGRES_USER: demo_user
+  POSTGRES_PASSWORD: demo_pass_change_me
+  POSTGRES_DB: demo_db
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: demo-app
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: nfs-client
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: demo-app
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: db-credentials
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "demo_user"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: demo-app
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-code
+  namespace: demo-app
+data:
+  app.py: |
+    import os, time
+    from flask import Flask, jsonify, request
+    import psycopg2
+    from psycopg2 import OperationalError
+
+    app = Flask(__name__)
+
+    DB_HOST = "postgres"
+    DB_NAME = os.environ.get("POSTGRES_DB")
+    DB_USER = os.environ.get("POSTGRES_USER")
+    DB_PASS = os.environ.get("POSTGRES_PASSWORD")
+
+    def get_conn():
+        return psycopg2.connect(host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASS)
+
+    def init_db():
+        for attempt in range(30):
+            try:
+                conn = get_conn()
+                cur = conn.cursor()
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS visits (
+                        id SERIAL PRIMARY KEY,
+                        note TEXT,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+                conn.commit()
+                cur.close()
+                conn.close()
+                print("DB ready")
+                return
+            except OperationalError:
+                print("waiting for db... attempt", attempt)
+                time.sleep(2)
+        raise Exception("DB never became ready")
+
+    init_db()
+
+    @app.route("/health")
+    def health():
+        return jsonify(status="ok")
+
+    @app.route("/api/visits", methods=["GET"])
+    def list_visits():
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT id, note, created_at FROM visits ORDER BY id DESC LIMIT 50")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify([{"id": r[0], "note": r[1], "created_at": str(r[2])} for r in rows])
+
+    @app.route("/api/visits", methods=["POST"])
+    def add_visit():
+        note = (request.json or {}).get("note", "hello from FE")
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO visits (note) VALUES (%s) RETURNING id", (note,))
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify(id=new_id, note=note), 201
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=5000)
+  requirements.txt: |
+    flask==3.0.3
+    psycopg2-binary==2.9.9
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: demo-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: python:3.11-slim
+          command: ["sh", "-c"]
+          args:
+            - pip install --no-cache-dir -r /app/requirements.txt && python /app/app.py
+          ports:
+            - containerPort: 5000
+          envFrom:
+            - secretRef:
+                name: db-credentials
+          volumeMounts:
+            - name: code
+              mountPath: /app
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: code
+          configMap:
+            name: backend-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: demo-app
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 5000
+      targetPort: 5000
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-html
+  namespace: demo-app
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Demo App - FE/BE/DB</title>
+      <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 40px auto; }
+        input, button { padding: 8px; font-size: 14px; }
+        li { margin: 4px 0; }
+      </style>
+    </head>
+    <body>
+      <h1>Demo App</h1>
+      <p>Frontend (nginx) &rarr; Backend (Flask) &rarr; Database (Postgres)</p>
+      <input id="note" placeholder="type a note" />
+      <button onclick="addVisit()">Submit</button>
+      <ul id="list"></ul>
+      <script>
+        const API = "/api/visits";
+        async function load() {
+          const res = await fetch(API);
+          const data = await res.json();
+          document.getElementById("list").innerHTML =
+            data.map(v => `<li>#${v.id} - ${v.note} (${v.created_at})</li>`).join("");
+        }
+        async function addVisit() {
+          const note = document.getElementById("note").value || "hello";
+          await fetch(API, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({note})
+          });
+          document.getElementById("note").value = "";
+          load();
+        }
+        load();
+      </script>
+    </body>
+    </html>
+  nginx.conf: |
+    server {
+      listen 80;
+      root /usr/share/nginx/html;
+      index index.html;
+
+      location /api/ {
+        proxy_pass http://backend:5000/api/;
+      }
+
+      location / {
+        try_files $uri $uri/ /index.html;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: demo-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+            - name: conf
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: nginx.conf
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+      volumes:
+        - name: html
+          configMap:
+            name: frontend-html
+            items:
+              - key: index.html
+                path: index.html
+        - name: conf
+          configMap:
+            name: frontend-html
+            items:
+              - key: nginx.conf
+                path: nginx.conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: demo-app
+spec:
+  selector:
+    app: frontend
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-app
+  namespace: demo-app
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: demo.uplab.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
