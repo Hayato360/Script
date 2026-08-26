@@ -56,7 +56,10 @@ KEEP_OLD_CONTAINERS=1          # how many rancher-old-* to always keep (most rec
 STARTUP_WARN_TIMEOUT=900       # seconds before we start logging loud warnings (does NOT stop the hop)
 STARTUP_HARD_ABORT=5400        # seconds (90m) of total unreachable-UI time before the hop truly gives up
 STARTUP_POLL_INTERVAL=10
-FATAL_THRESHOLD=2              # this many [FATAL] lines since last restart triggers remediation
+FATAL_WINDOW="3m"              # rolling look-back window for FATAL detection (NOT reset per-restart —
+                                # some environments crash-loop every ~30s with only 1 FATAL per boot,
+                                # so counting "since this boot" can miss the pattern entirely)
+FATAL_THRESHOLD=1              # this many [FATAL] webhook lines in the window triggers remediation
 WEBHOOK_FIX_RETRY_BUDGET=90    # seconds of rapid retry per remediation attempt (catches brief apiserver windows)
 REQUIRED_STABLE_SECONDS=360    # minutes of no-restart/no-FATAL required before re-enabling webhook (6m — empirically what it took)
 DISK_CHECK_INTERVAL=120        # re-run disk_guard this often while stuck waiting on a hop
@@ -238,32 +241,43 @@ backup_with_check() {
 #  cause after the first fix.)
 ########################################
 
-# attempt_webhook_scale_down: standing rapid-retry loop (catches the
-# brief window where the embedded apiserver is reachable between crashes).
-# Returns 0 once the scale-to-0 call has been confirmed to succeed.
-attempt_webhook_scale_down() {
-  local budget="$1"
-  local start
-  start=$(date +%s)
-  local deleted=0 scaled=0
-  while (( $(date +%s) - start < budget )); do
-    if (( deleted == 0 )); then
-      if docker exec rancher sh -c 'kubectl delete validatingwebhookconfigurations --all --ignore-not-found=true; kubectl delete mutatingwebhookconfigurations --all --ignore-not-found=true' >/dev/null 2>&1; then
-        deleted=1
-        log "  webhook configs cleared"
-      fi
-    fi
-    if docker exec rancher kubectl scale deployment rancher-webhook -n cattle-system --replicas=0 >/dev/null 2>&1; then
-      scaled=1
-      log "  rancher-webhook scaled to 0 replicas"
-      return 0
-    fi
-    sleep 0.5
-  done
-  return 1
+# start_webhook_reapply_loop: launches a persistent BACKGROUND loop that
+# re-deletes webhook configs and re-scales rancher-webhook to 0 every
+# second, indefinitely, until stopped. Found necessary in practice: a
+# single successful scale-to-0 can be lost if the outer container crashes
+# again before that write is durably committed to the embedded datastore
+# (this environment runs "--cluster-reset" on effectively every boot,
+# which can restore state from just before our edit). Reapplying every
+# ~1s means we don't depend on one lucky write — any write that lands in
+# a cycle with enough time to commit before the next crash is sufficient,
+# and eventually the crash cycle itself stops once rancher-webhook gets
+# real uninterrupted time to finish its own startup.
+REAPPLY_PID=""
+start_webhook_reapply_loop() {
+  (( ${REAPPLY_PID:-0} != 0 )) 2>/dev/null && return 0   # already running
+  (
+    while true; do
+      docker exec rancher sh -c 'kubectl delete validatingwebhookconfigurations --all --ignore-not-found=true; kubectl delete mutatingwebhookconfigurations --all --ignore-not-found=true' >/dev/null 2>&1
+      docker exec rancher kubectl scale deployment rancher-webhook -n cattle-system --replicas=0 >/dev/null 2>&1
+      sleep 1
+    done
+  ) &
+  REAPPLY_PID=$!
+  log "  started continuous webhook-remediation loop (pid $REAPPLY_PID)"
 }
 
-# attempt_webhook_scale_up: same idea, for re-enabling after stability.
+stop_webhook_reapply_loop() {
+  if [[ -n "$REAPPLY_PID" ]]; then
+    kill "$REAPPLY_PID" >/dev/null 2>&1
+    wait "$REAPPLY_PID" 2>/dev/null
+    log "  stopped webhook-remediation loop (pid $REAPPLY_PID)"
+    REAPPLY_PID=""
+  fi
+}
+trap 'stop_webhook_reapply_loop' EXIT
+
+# attempt_webhook_scale_up: bounded rapid-retry, used once when re-enabling
+# after a confirmed stable window.
 attempt_webhook_scale_up() {
   local budget="$1"
   local start
@@ -287,21 +301,25 @@ attempt_webhook_scale_up() {
 # "script dies mid-run on the first hop that doesn't self-heal instantly".
 ########################################
 wait_for_startup() {
-  local start last_disk_check last_started_at="" stable_since=0
-  local webhook_down=0 webhook_reenabled=1 warned=0
+  local start last_disk_check last_started_at="" stable_since
+  local remediation_active=0 webhook_reenabled=1 warned=0
   start=$(date +%s)
   last_disk_check=$start
+  stable_since=$start
 
   while true; do
     local now
     now=$(date +%s)
 
     if curl -sk -o /dev/null --max-time 5 -w '%{http_code}' https://localhost 2>/dev/null | grep -qE '^(200|301|302|401)$'; then
+      stop_webhook_reapply_loop
       log "UI reachable — hop startup complete (after $((now - start))s)"
       return 0
     fi
 
-    # detect a fresh container restart -> reset the clean-streak clock
+    # detect a fresh container restart -> reset the clean-streak clock.
+    # (the reapply loop, if active, keeps running regardless of restarts —
+    # it doesn't need re-arming since it never stopped in the first place)
     local started_at
     started_at=$(docker inspect rancher --format '{{.State.StartedAt}}' 2>/dev/null || true)
     if [[ -n "$started_at" && "$started_at" != "$last_started_at" ]]; then
@@ -319,32 +337,32 @@ wait_for_startup() {
       last_disk_check="$now"
     fi
 
-    # FATAL burst detection since this boot started
+    # FATAL detection over a rolling window (NOT scoped to "since this boot" —
+    # a fast crash-loop can produce just 1 FATAL per ~30s boot cycle, which
+    # would never accumulate to a per-boot threshold before the next restart
+    # resets it; a time-based window catches that pattern reliably)
     local fatal_count
-    fatal_count=$(docker logs --since "$started_at" rancher 2>&1 | grep -c '\[FATAL\]' || true)
-    if (( fatal_count >= FATAL_THRESHOLD )); then
-      if (( webhook_down == 0 )); then
-        log "FATAL burst detected ($fatal_count since last restart) at $((now - start))s — applying webhook remediation"
-        if attempt_webhook_scale_down "$WEBHOOK_FIX_RETRY_BUDGET"; then
-          webhook_down=1
-          stable_since="$now"   # require a fresh clean window measured from the fix, not the boot
-        else
-          log "  remediation attempt could not reach the apiserver this cycle — will retry"
-        fi
-      fi
-      # if we already scaled down but FATALs keep coming, the outer container
-      # is still crash-looping; just keep waiting for the restart-detection
-      # branch above to trigger another remediation attempt on the next boot.
+    fatal_count=$(docker logs --since "$FATAL_WINDOW" rancher 2>&1 | grep -c '\[FATAL\]' || true)
+    if (( fatal_count >= FATAL_THRESHOLD )) && (( remediation_active == 0 )); then
+      log "FATAL detected ($fatal_count in last $FATAL_WINDOW) at $((now - start))s — starting continuous webhook remediation"
+      start_webhook_reapply_loop
+      remediation_active=1
+      stable_since="$now"   # require a fresh clean window measured from when we started fixing, not the boot
     fi
 
-    # once webhook is down and we've had a real stable window, re-enable it
-    if (( webhook_down == 1 && webhook_reenabled == 0 )) && (( now - stable_since >= REQUIRED_STABLE_SECONDS )); then
-      log "Stable for $((now - stable_since))s — re-enabling rancher-webhook"
+    # once remediation is active and we've had a real stable window
+    # (measured from the last restart OR the start of remediation,
+    # whichever is more recent), stop reapplying and re-enable the webhook
+    if (( remediation_active == 1 && webhook_reenabled == 0 )) && (( now - stable_since >= REQUIRED_STABLE_SECONDS )); then
+      log "Stable for $((now - stable_since))s — stopping remediation loop and re-enabling rancher-webhook"
+      stop_webhook_reapply_loop
       if attempt_webhook_scale_up "$WEBHOOK_FIX_RETRY_BUDGET"; then
         webhook_reenabled=1
-        webhook_down=0
+        remediation_active=0
       else
-        log "  scale-to-1 could not be confirmed this cycle — will retry"
+        log "  scale-to-1 could not be confirmed — resuming remediation loop as a safety net"
+        start_webhook_reapply_loop
+        stable_since="$now"
       fi
     fi
 
@@ -354,6 +372,7 @@ wait_for_startup() {
     fi
     if (( now - start >= STARTUP_HARD_ABORT )); then
       log "WARNING: hard abort ceiling (${STARTUP_HARD_ABORT}s) reached without a stable startup"
+      stop_webhook_reapply_loop
       return 1
     fi
 
