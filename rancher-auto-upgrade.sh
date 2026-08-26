@@ -422,6 +422,49 @@ run_one_hop() {
 }
 
 ########################################
+# Post-upgrade webhook sanity check
+# (found in the wild: after crossing into v2.13.x/v2.14.x+ where
+#  rancher-turtles/embedded-CAPI provisioning was introduced, an
+#  upgrade can leave a STALE duplicate MutatingWebhookConfiguration/
+#  ValidatingWebhookConfiguration behind — same webhook rule names as
+#  the correct, currently-installed one, but pointing at a namespace
+#  that no longer exists. Kubernetes calls EVERY matching webhook
+#  config for a resource, so the stale one silently blocks cluster
+#  object updates even though a correct config exists side-by-side.
+#  This only DETECTS and REPORTS — it does not auto-delete, since
+#  removing the wrong webhook config on a real customer's cluster
+#  unattended is too risky to fully automate.)
+########################################
+check_stale_webhook_configs() {
+  log "Checking for stale/duplicate webhook configs (known v2.13+/v2.14+ CAPI upgrade artifact)..."
+  local kind
+  for kind in mutatingwebhookconfigurations validatingwebhookconfigurations; do
+    local names
+    names=$(docker exec rancher kubectl get "$kind" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
+    [[ -z "$names" ]] && continue
+    local n
+    for n in $names; do
+      local rules
+      rules=$(docker exec rancher kubectl get "$kind" "$n" -o jsonpath='{range .webhooks[*]}{.clientConfig.service.namespace}{"/"}{.clientConfig.service.name}{"\n"}{end}' 2>/dev/null)
+      [[ -z "$rules" ]] && continue
+      local svc_ns svc_name missing=0 total=0
+      while IFS='/' read -r svc_ns svc_name; do
+        [[ -z "$svc_ns" ]] && continue
+        total=$((total + 1))
+        if ! docker exec rancher kubectl get svc "$svc_name" -n "$svc_ns" >/dev/null 2>&1; then
+          missing=$((missing + 1))
+        fi
+      done <<< "$rules"
+      if (( total > 0 && missing == total )); then
+        log "  WARNING: $kind/$n has ALL $total webhook rule(s) pointing at a service that does not exist — likely a stale duplicate from an earlier version."
+        log "    Review before deleting: docker exec rancher kubectl get $kind $n -o jsonpath='{range .webhooks[*]}{.name}{\"  ->  \"}{.clientConfig.service.namespace}{\"/\"}{.clientConfig.service.name}{\"\\n\"}{end}'"
+        log "    If confirmed stale (a differently-named, working config exists covering the same rules): docker exec rancher kubectl delete $kind $n"
+      fi
+    done
+  done
+}
+
+########################################
 # Main
 ########################################
 log "Starting automated Rancher upgrade -> target $TARGET"
@@ -446,5 +489,6 @@ log "=================================================="
 docker ps --filter name=rancher | tee -a "$LOG_FILE"
 docker inspect rancher --format 'Final image: {{.Config.Image}}' | tee -a "$LOG_FILE"
 docker exec rancher kubectl get nodes -o wide 2>/dev/null | tee -a "$LOG_FILE"
+check_stale_webhook_configs
 log "Automated upgrade run finished. Review $LOG_FILE for the full timeline."
 log "NOTE: old rancher-old-* containers/images from this run were kept for rollback (Section 7.1/7.2 of the KB) — clean up manually after 1-2 weeks of stable operation."
