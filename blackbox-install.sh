@@ -8,8 +8,11 @@
 #   1. Helm chart prometheus-community/prometheus-blackbox-exporter  (ns blackbox)
 #   2. Probe 01-coredns         (dns_udp  -> cluster DNS service)
 #   3. Probe 02-rancher-health  (http_2xx -> <Rancher URL>/healthz)
-#   4. If the Cert remoteWrite keep regex has no probe_, offers to change it to
-#      "<old>|probe_.*" (e.g. x509_.*|probe_.*) with kubectl patch (backup saved)
+#   4. Makes sure probe_* reaches tenant rancher-health (what the Blackbox dashboard reads):
+#      - entry with tenant rancher-health but no probe_ -> regex "<old>|probe_.*"
+#      - Cert entry uses another tenant (e.g. rancher-cert) -> adds entry <cluster>-health
+#        (tenant rancher-health, keep probe_.*, same secret, cluster + public_ip labels)
+#      asks first, kubectl patch, backup saved in WORKDIR
 #   (no TCP probe - 03-rancher-tcp-probe is skipped on purpose)
 #
 # Run on : a master node or the Rancher VM, as root, with kubeconfig of the cluster
@@ -17,6 +20,7 @@
 #
 # Optional env (otherwise detected / asked):
 #   You fill (asked): CLUSTER_NAME=mycluster  RANCHER_URL=https://rancher.customer.com  DNS_TARGET=<svc>:53|skip
+#                     PUBLIC_IP=x.x.x.x (only when a rancher-health remoteWrite must be added)  BB_TENANT=rancher-health
 #   KUBECONFIG=/root/.kube/<cluster>.yaml
 #   BB_NS=blackbox  BB_RELEASE=blackbox-exporter  BB_CHART_VERSION=<chart version>
 #   PROBE_NS=<ns>  PROBE_RELEASE_LABEL=<release label>  WORKDIR=/root/blackbox  ASSUME_YES=y
@@ -152,34 +156,53 @@ OTHER_SEL=$(pjp '{.spec.probeSelector.matchLabels}' | grep -o '"[^"]*":' | tr -d
 
 # remoteWrite from Cert setup
 RW_URL=$(pjp '{.spec.remoteWrite[*].url}')
-# find the OLS Observe remoteWrite entry and its "keep" rule index
-RW_IDX=""; KEEP_IDX=""; RW_KEEP=""; FIX_REGEX=""
-i=0
-while read -r u; do
-        [[ "$u" == *metrics-gateway.olsxops.com* ]] && { RW_IDX=$i; break; }
-        i=$((i+1))
-done < <(pjp '{range .spec.remoteWrite[*]}{.url}{"\n"}{end}')
-if [[ -n "$RW_IDX" ]]; then
-        k=0
+# The Blackbox dashboard in Observe reads tenant rancher-health (X-Scope-OrgID).
+# Cases:  an entry with tenant rancher-health keeps probe_         -> nothing to do
+#         an entry with tenant rancher-health but keep lacks probe_ -> extend its regex (FIX_REGEX)
+#         only other tenants (e.g. rancher-cert)                   -> add a new probe_-only entry (ADD_ENTRY)
+BB_TENANT=${BB_TENANT:-rancher-health}
+RW_IDX=""; TEN_IDX=""; HEALTH_OK=""; KEEP_IDX=""; RW_KEEP=""; FIX_REGEX=""; FIX_IDX=""; ADD_ENTRY=""
+keep_idx() { # index of the keep rule in remoteWrite[$1]
+        local k=0 a
         while read -r a; do
-                [[ "${a,,}" == keep ]] && { KEEP_IDX=$k; break; }
+                [[ "${a,,}" == keep ]] && { echo $k; return; }
                 k=$((k+1))
-        done < <(pjp "{range .spec.remoteWrite[$RW_IDX].writeRelabelConfigs[*]}{.action}{\"\n\"}{end}")
-        [[ -n "$KEEP_IDX" ]] && RW_KEEP=$(pjp "{.spec.remoteWrite[$RW_IDX].writeRelabelConfigs[$KEEP_IDX].regex}")
-fi
+        done < <(pjp "{range .spec.remoteWrite[$1].writeRelabelConfigs[*]}{.action}{\"\n\"}{end}")
+}
+NRW=$(pjp '{range .spec.remoteWrite[*]}{.url}{"\n"}{end}' | grep -c .)
+for ((i=0; i<NRW; i++)); do
+        u=$(pjp "{.spec.remoteWrite[$i].url}")
+        [[ "$u" == *metrics-gateway.olsxops.com* ]] || continue
+        [[ -z "$RW_IDX" ]] && RW_IDX=$i
+        t=$(pjp "{.spec.remoteWrite[$i].headers.X-Scope-OrgID}")
+        ki=$(keep_idx $i); kr=""
+        [[ -n "$ki" ]] && kr=$(pjp "{.spec.remoteWrite[$i].writeRelabelConfigs[$ki].regex}")
+        info "remoteWrite[$i]: tenant=${t:-none}  keep=${kr:-<all metrics>}"
+        if [[ "$t" == "$BB_TENANT" ]]; then
+                if [[ -z "$kr" || "$kr" == *probe_* ]]; then HEALTH_OK=$i
+                elif [[ -z "$TEN_IDX" ]]; then TEN_IDX=$i; KEEP_IDX=$ki; RW_KEEP=$kr; fi
+        fi
+done
 RW_CLUSTER=$(pjp "{.spec.remoteWrite[${RW_IDX:-0}].writeRelabelConfigs[?(@.targetLabel==\"cluster\")].replacement}" | awk '{print $1}')
+RW_PIP=$(pjp "{.spec.remoteWrite[${RW_IDX:-0}].writeRelabelConfigs[?(@.targetLabel==\"public_ip\")].replacement}" | awk '{print $1}')
 if [[ -z "$RW_URL" ]]; then
         warn "No remoteWrite on Prometheus -> probe results stay local only (Cert setup not done?)"
 elif [[ -z "$RW_IDX" ]]; then
         warn "No remoteWrite to metrics-gateway.olsxops.com (found: $RW_URL) -> probe results not sent to Observe"
+elif [[ -n "$HEALTH_OK" ]]; then
+        ok "probe_* already goes to tenant $BB_TENANT (remoteWrite[$HEALTH_OK])"
+elif [[ -n "$TEN_IDX" ]]; then
+        warn "remoteWrite[$TEN_IDX] (tenant $BB_TENANT) keeps only '$RW_KEEP' -> probe_* NOT sent"
+        FIX_IDX=$TEN_IDX; FIX_REGEX="$RW_KEEP|probe_.*"
 else
-        ok "remoteWrite[$RW_IDX]: $(pjp "{.spec.remoteWrite[$RW_IDX].url}")"
-        if [[ -n "$RW_KEEP" && "$RW_KEEP" != *probe_* ]]; then
-                warn "remoteWrite keep regex is '$RW_KEEP' -> probe_* is NOT sent to Observe"
-                FIX_REGEX="$RW_KEEP|probe_.*"
-        else
-                ok "keep regex includes probe_ (${RW_KEEP:-no filter})"
-        fi
+        warn "No remoteWrite to tenant $BB_TENANT -> Blackbox dashboard will not show this cluster"
+        ADD_ENTRY=1
+        RW_SURL=$(pjp "{.spec.remoteWrite[$RW_IDX].url}")
+        RW_UNAME=$(pjp "{.spec.remoteWrite[$RW_IDX].basicAuth.username.name}")
+        RW_UKEY=$(pjp "{.spec.remoteWrite[$RW_IDX].basicAuth.username.key}")
+        RW_PNAME=$(pjp "{.spec.remoteWrite[$RW_IDX].basicAuth.password.name}")
+        RW_PKEY=$(pjp "{.spec.remoteWrite[$RW_IDX].basicAuth.password.key}")
+        [[ -z "$RW_UNAME" ]] && { warn "Existing remoteWrite has no basicAuth secret - cannot copy it, add the entry manually"; ADD_ENTRY=""; }
 fi
 
 EXIST=$(kubectl get deploy -A --no-headers 2>/dev/null | grep -i blackbox | grep -v "^$BB_NS[[:space:]]*$BB_RELEASE-")
@@ -254,12 +277,27 @@ info "02-rancher-health : http_2xx -> $RANCHER_URL/healthz"
 info "03-rancher-tcp    : skipped"
 if [[ -n "$FIX_REGEX" ]]; then
         echo ""
-        warn "remoteWrite only sends '$RW_KEEP' -> blackbox results will NOT reach Observe"
+        warn "remoteWrite[$FIX_IDX] (tenant $BB_TENANT) only sends '$RW_KEEP' -> blackbox results will NOT reach Observe"
         ask FIX_KEEP "Change keep regex to '$FIX_REGEX' (as in the manual)? y/n" "y"
         if [[ "$FIX_KEEP" =~ ^[Yy]$ ]]; then
-                info "remoteWrite keep : '$RW_KEEP' -> '$FIX_REGEX'  (kubectl patch, tenant header unchanged)"
+                info "remoteWrite keep : '$RW_KEEP' -> '$FIX_REGEX'  (kubectl patch)"
         else
                 FIX_REGEX=""; info "remoteWrite keep : unchanged (probe_* stays local)"
+        fi
+fi
+if [[ -n "$ADD_ENTRY" ]]; then
+        echo ""
+        warn "Cert remoteWrite uses another tenant; the Blackbox dashboard reads tenant $BB_TENANT"
+        while :; do
+                ask PUBLIC_IP "4) Public IP of this customer (label public_ip=)" "$RW_PIP"
+                [[ "$PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && break
+                echo -e "  ${RED}Enter an IPv4 address, e.g. 203.150.193.89${NC}"; PUBLIC_IP=""
+        done
+        ask ADD_RW "Add remoteWrite '$CLUSTER_NAME-health' (tenant $BB_TENANT, probe_.* only)? y/n" "y"
+        if [[ "$ADD_RW" =~ ^[Yy]$ ]]; then
+                info "remoteWrite add  : $CLUSTER_NAME-health -> $RW_SURL  tenant=$BB_TENANT keep=probe_.*  public_ip=$PUBLIC_IP"
+        else
+                ADD_ENTRY=""; info "remoteWrite add  : skipped (Blackbox dashboard will not show this cluster)"
         fi
 fi
 info "Files saved in    : $WORKDIR"
@@ -370,23 +408,37 @@ probe_yaml rancher-health http_2xx "$RANCHER_URL/healthz" monitoring > "$WORKDIR
 kubectl apply -f "$WORKDIR/02-rancher-health-probe.yaml" || fail "apply 02-rancher-health-probe.yaml failed"
 kubectl get probes.monitoring.coreos.com -n "$PROBE_NS"
 
+PATCHED=""
+if [[ -n "$FIX_REGEX" || -n "$ADD_ENTRY" ]]; then
+        kubectl get prometheus -n "$PNS" "$PNAME" -o yaml > "$WORKDIR/prometheus-$PNAME.backup.yaml" 2>/dev/null
+        info "backup: $WORKDIR/prometheus-$PNAME.backup.yaml"
+fi
 if [[ -n "$FIX_REGEX" ]]; then
-        RPATH="/spec/remoteWrite/$RW_IDX/writeRelabelConfigs/$KEEP_IDX/regex"
+        RPATH="/spec/remoteWrite/$FIX_IDX/writeRelabelConfigs/$KEEP_IDX/regex"
         # "test" op = only change if the value is still exactly the old one
         PATCH=$(printf '[{"op":"test","path":"%s","value":"%s"},{"op":"replace","path":"%s","value":"%s"}]' \
                 "$RPATH" "${RW_KEEP//\\/\\\\}" "$RPATH" "${FIX_REGEX//\\/\\\\}")
-        kubectl get prometheus -n "$PNS" "$PNAME" -o yaml > "$WORKDIR/prometheus-$PNAME.backup.yaml" 2>/dev/null
         if kubectl patch prometheus -n "$PNS" "$PNAME" --type=json -p="$PATCH"; then
-                ok "keep regex now: $(pjp "{.spec.remoteWrite[$RW_IDX].writeRelabelConfigs[$KEEP_IDX].regex}")"
-                info "backup: $WORKDIR/prometheus-$PNAME.backup.yaml"
-                case "$PNAME" in rancher-monitoring-*|kube-prometheus-stack-*)
-                        warn "Prometheus is Helm-managed: also put this regex in the app values"
-                        info "(Rancher > Apps > Installed Apps > ${PNAME%-prometheus} > Edit YAML > prometheus.prometheusSpec.remoteWrite)"
-                        info "or the next upgrade of the monitoring app reverts it" ;;
-                esac
+                ok "keep regex now: $(pjp "{.spec.remoteWrite[$FIX_IDX].writeRelabelConfigs[$KEEP_IDX].regex}")"; PATCHED=1
         else
                 warn "Patch not applied (regex changed meanwhile?) - edit manually: kubectl edit prometheus -n $PNS $PNAME"
         fi
+fi
+if [[ -n "$ADD_ENTRY" ]]; then
+        ENTRY=$(printf '{"url":"%s","name":"%s-health","basicAuth":{"username":{"name":"%s","key":"%s"},"password":{"name":"%s","key":"%s"}},"headers":{"X-Scope-OrgID":"%s"},"writeRelabelConfigs":[{"action":"keep","sourceLabels":["__name__"],"regex":"probe_.*"},{"action":"replace","replacement":"%s","targetLabel":"cluster"},{"action":"replace","replacement":"%s","targetLabel":"public_ip"}]}' \
+                "$RW_SURL" "$CLUSTER_NAME" "$RW_UNAME" "$RW_UKEY" "$RW_PNAME" "$RW_PKEY" "$BB_TENANT" "$CLUSTER_NAME" "$PUBLIC_IP")
+        if kubectl patch prometheus -n "$PNS" "$PNAME" --type=json -p="[{\"op\":\"add\",\"path\":\"/spec/remoteWrite/-\",\"value\":$ENTRY}]"; then
+                ok "Added remoteWrite $CLUSTER_NAME-health (tenant $BB_TENANT, probe_.*)"; PATCHED=1
+        else
+                warn "Could not add remoteWrite entry - add it manually: kubectl edit prometheus -n $PNS $PNAME"
+        fi
+fi
+if [[ -n "$PATCHED" ]]; then
+        case "$PNAME" in rancher-monitoring-*|kube-prometheus-stack-*)
+                warn "Prometheus is Helm-managed: also put this remoteWrite change in the app values"
+                info "(Rancher > Apps > Installed Apps > ${PNAME%-prometheus} > Edit YAML > prometheus.prometheusSpec.remoteWrite)"
+                info "or the next upgrade of the monitoring app reverts it" ;;
+        esac
 fi
 
 #############################################################

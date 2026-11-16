@@ -24,6 +24,8 @@
 PATH=$PATH:/var/lib/rancher/rke2/bin:/usr/local/bin
 CERT_WARN_DAYS=${CERT_WARN_DAYS:-30}
 OBSERVE_HOST=${OBSERVE_HOST:-metrics-gateway.olsxops.com}
+BB_TENANT=${BB_TENANT:-rancher-health}   # tenant (X-Scope-OrgID) the Blackbox dashboard reads
+X509_PUSH=""; PROBE_PUSH=""
 
 bold=$(tput bold 2>/dev/null)
 normal=$(tput sgr0 2>/dev/null)
@@ -229,9 +231,27 @@ else
                         [[ "$RW_HDR" == *X-Scope-OrgID* ]] || { warn "No X-Scope-OrgID header (tenant)"; }
                         [[ -z "$RW_CLUSTER" ]] && warn "No cluster label relabel -> cannot tell clusters apart in Grafana"
                         [[ -z "$RW_PIP" ]] && warn "No public_ip label relabel"
-                        if [[ -n "$RW_KEEP" ]]; then
-                                [[ "$RW_KEEP" == *x509_* ]]  || warn "keep regex has no x509_  -> cert metrics NOT pushed"
-                                [[ "$RW_KEEP" == *probe_* ]] || warn "keep regex has no probe_ -> blackbox metrics NOT pushed"
+                        # look at ALL entries to Observe: which tenant gets x509_ / probe_ ?
+                        X509_PUSH=0; PROBE_PUSH=0; PROBE_OTHER=""
+                        NRW=$(grep -c . <<<"$RW_URLS")
+                        for ((j=0; j<NRW; j++)); do
+                                pj() { kubectl get prometheus -n "$PNS" "$PNAME" -o jsonpath="{.spec.remoteWrite[$j]$1}" 2>/dev/null; }
+                                [[ "$(pj '.url')" == *"$OBSERVE_HOST"* ]] || continue
+                                jt=$(pj '.headers.X-Scope-OrgID')
+                                jk=$(pj '.writeRelabelConfigs[?(@.action=="keep")].regex')
+                                [[ $j -ne $IDX ]] && info "remoteWrite[$j] name=$(pj '.name') tenant=${jt:-none} keep=${jk:-<all>}"
+                                [[ -z "$jk" || "$jk" == *x509_* ]] && X509_PUSH=1
+                                if [[ -z "$jk" || "$jk" == *probe_* ]]; then
+                                        if [[ "$jt" == "$BB_TENANT" ]]; then PROBE_PUSH=1; else PROBE_OTHER=${jt:-none}; fi
+                                fi
+                        done
+                        [[ $X509_PUSH -eq 1 ]] || warn "No remoteWrite keeps x509_ -> cert metrics NOT pushed"
+                        if [[ $PROBE_PUSH -eq 1 ]]; then
+                                ok "probe_* is pushed to tenant $BB_TENANT (Blackbox dashboard)"
+                        elif [[ -n "$PROBE_OTHER" ]]; then
+                                warn "probe_* goes to tenant '$PROBE_OTHER', but the Blackbox dashboard reads '$BB_TENANT' -> cluster not shown"
+                        else
+                                warn "No remoteWrite sends probe_* to tenant '$BB_TENANT' -> blackbox NOT in Observe"
                         fi
 
                         # basic auth secret (only check keys exist, never print values)
@@ -324,7 +344,7 @@ else
         if [[ "$RES_CERT" == "OK" && "$RES_RW" != "OK" ]]; then
                 RES_CERT="FAIL"; NOTE_CERT="มี cert metrics แต่ไม่ได้ส่งไป Observe"
         fi
-        if [[ "$RES_CERT" == "OK" && -n "$RW_KEEP" && "$RW_KEEP" != *x509_* && -n "$X509N" ]]; then
+        if [[ "$RES_CERT" == "OK" && "$X509_PUSH" == 0 && -n "$X509N" ]]; then
                 RES_CERT="FAIL"; NOTE_CERT="keep regex ไม่มี x509_"
         fi
 fi
@@ -410,8 +430,8 @@ fi
 if [[ $BB_OK -eq 1 && "$RES_RW" != "OK" ]]; then
         BB_OK=0; NOTE_BB="probe มี แต่ไม่ได้ส่งไป Observe"
 fi
-if [[ $BB_OK -eq 1 && -n "$RW_KEEP" && "$RW_KEEP" != *probe_* ]]; then
-        BB_OK=0; NOTE_BB="keep regex ไม่มี probe_"
+if [[ $BB_OK -eq 1 && "$PROBE_PUSH" == 0 ]]; then
+        BB_OK=0; NOTE_BB="probe_ ไม่ได้ส่งไป tenant $BB_TENANT"
 fi
 [[ "$RES_PROM" != "OK" && -z "$NOTE_BB" ]] && NOTE_BB="ไม่มี Prometheus"
 [[ $BB_OK -eq 1 ]] && RES_BB="OK" || RES_BB="FAIL"
