@@ -109,7 +109,12 @@ info "KUBECONFIG = ${KUBECONFIG:-(kubectl default)}"
 
 if ! kubectl get nodes >/dev/null 2>&1; then
         bad "Cannot reach the cluster with this kubeconfig"
-        kubectl get nodes 2>&1 | head -3 | sed 's/^/         /'
+        KERR=$(kubectl get nodes 2>&1)
+        echo "$KERR" | grep -v memcache.go | head -3 | sed 's/^/         /'
+        if grep -qiE 'system:unauthenticated|Unauthorized|token' <<<"$KERR"; then
+                info "-> Kubeconfig token expired/deleted. Rancher UI > Cluster Management > cluster > Download KubeConfig,"
+                info "   save as /root/.kube/<cluster>.yaml and run with KUBECONFIG=/root/.kube/<cluster>.yaml"
+        fi
         exit 1
 fi
 NODES=$(kubectl get nodes --no-headers 2>/dev/null | wc -l)

@@ -94,15 +94,25 @@ fi
 if ! command -v helm >/dev/null 2>&1; then
         warn "helm not found -> downloading a temporary helm to /tmp (removed at exit)"
         tmpdir
-        HV=$(curl -sL -m 15 https://api.github.com/repos/helm/helm/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
-        HV=${HV:-v3.16.4}
+        HV=${HELM_VERSION:-v3.17.3}   # pinned Helm 3 (Helm 4 changed flags)
         curl -sL -m 120 "https://get.helm.sh/helm-$HV-linux-$ARCH.tar.gz" | tar -xz -C "$TMPD" --strip-components=1 "linux-$ARCH/helm" \
                 && "$TMPD/helm" version >/dev/null 2>&1 || fail "Cannot download helm"
         PATH=$TMPD:$PATH
 fi
 ok "kubectl + helm ready ($(helm version --short 2>/dev/null))"
 
-kubectl get nodes -o wide || fail "Cannot reach the cluster with $KUBECONFIG"
+if ! KERR=$(kubectl get nodes -o wide 2>&1); then
+        echo "$KERR" | grep -v memcache.go | head -3 | sed 's/^/         /'
+        if grep -qiE 'system:unauthenticated|Unauthorized|token' <<<"$KERR"; then
+                info "-> The kubeconfig token is expired/deleted (Rancher kubeconfig tokens have a TTL)."
+                info "   Rancher UI > Cluster Management > this cluster > (3 dots) Download KubeConfig"
+                info "   save as /root/.kube/<cluster>.yaml, then run:"
+                info "   KUBECONFIG=/root/.kube/<cluster>.yaml bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/blackbox-install.sh)"
+                info "   (or run on an RKE2 master node: it uses /etc/rancher/rke2/rke2.yaml)"
+        fi
+        fail "Cannot reach the cluster with $KUBECONFIG"
+fi
+echo "$KERR"
 K8SVER=$(kubectl get nodes --no-headers | awk 'NR==1{print $5}')
 
 #############################################################
