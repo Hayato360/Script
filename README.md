@@ -12,3 +12,11 @@ Run on the Rancher VM as root, with the downstream cluster kubeconfig:
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/rancher-monitoring-v2.sh)
 ```
+
+## OLS Observe check (read-only: Prometheus / Cert / Blackbox)
+
+Run on a master node or the Rancher VM (needs kubectl + kubeconfig). Changes nothing:
+
+```bash
+bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/observe-check.sh)
+```
