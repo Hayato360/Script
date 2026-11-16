@@ -20,3 +20,12 @@ Run on a master node or the Rancher VM (needs kubectl + kubeconfig). Changes not
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/observe-check.sh)
 ```
+
+## Blackbox add-on (for clusters that already have Cert / remoteWrite)
+
+Installs blackbox-exporter + CoreDNS and Rancher /healthz probes (no TCP probe).
+Asks you for: cluster name, Rancher URL, DNS target. Everything else is auto-detected.
+
+```bash
+bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/blackbox-install.sh)
+```
