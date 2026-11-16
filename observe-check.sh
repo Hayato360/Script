@@ -412,7 +412,8 @@ fi
 [[ $BB_OK -eq 1 ]] && RES_BB="OK" || RES_BB="FAIL"
 
 #############################################################
-step "Summary  ($(hostname)  ${RW_CLUSTER:+cluster=$RW_CLUSTER})"
+FIRSTNODE=$(kubectl get nodes --no-headers 2>/dev/null | awk 'NR==1{print $1}')
+step "Summary  (run on $(hostname), cluster: ${RW_CLUSTER:-$FIRSTNODE ...}, $NODES nodes)"
 #############################################################
 show() {
         local name=$1 res=$2 note=$3 c=$NC
