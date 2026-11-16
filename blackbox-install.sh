@@ -349,16 +349,34 @@ PPOD=$(kubectl get pod -n "$PNS" -l "operator.prometheus.io/name=$PNAME" -o json
 [[ -z "$PPOD" ]] && PPOD="prometheus-$PNAME-0"
 promq() { kubectl exec -n "$PNS" "$PPOD" -c prometheus -- promtool query instant http://localhost:9090 "$1" 2>/dev/null; }
 
-RESULT=""
-for i in $(seq 1 12); do
-        RESULT=$(promq 'probe_success{job=~"probe/.*/(coredns|rancher-health)"}' | sed -E 's/ @\[.*$//')
-        [[ -n "$RESULT" ]] && break
+RESULT=""; CANQ=0; INCONF=0
+[[ "$(promq 'vector(1)' | awk -F' => ' 'NR==1{split($2,a," "); print a[1]}')" == 1 ]] && CANQ=1
+[[ $CANQ -eq 0 ]] && warn "Cannot query Prometheus with kubectl exec (permission?) - only checking config"
+# did the operator put the Probe jobs into the Prometheus config?
+inconf() {
+        kubectl get secret -n "$PNS" "prometheus-$PNAME" -o jsonpath='{.data.prometheus\.yaml\.gz}' 2>/dev/null \
+                | base64 -d 2>/dev/null | gunzip 2>/dev/null | grep -c "job_name: probe/$PROBE_NS/"
+}
+for i in $(seq 1 18); do
+        [[ $INCONF -eq 0 && "$(inconf)" -gt 0 ]] 2>/dev/null && { INCONF=1; ok "Probe jobs are in Prometheus config (selected OK)"; }
+        if [[ $CANQ -eq 1 ]]; then
+                RESULT=$(promq 'probe_success{job=~"probe/.*/(coredns|rancher-health)"}' | sed -E 's/ @\[.*$//')
+                [[ -n "$RESULT" ]] && break
+        elif [[ $INCONF -eq 1 ]]; then
+                break
+        fi
         sleep 10
 done
 if [[ -z "$RESULT" ]]; then
-        warn "No probe_success yet. Check later:"
-        info "kubectl logs -n $PNS $PPOD -c prometheus | grep -i probe"
-        info "or run: bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/observe-check.sh)"
+        if [[ $INCONF -eq 0 ]]; then
+                warn "Probe jobs NOT in Prometheus config after 3 min -> Prometheus does not select the Probes"
+                info "check: kubectl get prometheus -n $PNS $PNAME -o yaml | grep -A3 -i probe"
+                info "Probe labels: kubectl get probes -n $PROBE_NS --show-labels"
+        elif [[ $CANQ -eq 1 ]]; then
+                warn "Probes are configured but no probe_success yet - check scrape errors:"
+                info "kubectl exec -n $PNS $PPOD -c prometheus -- promtool query instant http://localhost:9090 'up{job=~\"probe/.*\"}'"
+        fi
+        info "Re-check in a few minutes: bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/observe-check.sh)"
 else
         while IFS= read -r l; do
                 job=$(grep -o 'job="[^"]*"' <<<"$l" | cut -d'"' -f2)
