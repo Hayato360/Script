@@ -174,9 +174,9 @@ promq() {
         kubectl exec -n "$PNS" "$PPOD" -c prometheus -- promtool query instant http://localhost:9090 "$1" 2>/dev/null
 }
 # first value of a query (or empty)
-pval() { promq "$1" | awk -F' => ' 'NR==1{split($2,a," "); print a[1]}'; }
-# "labels => value" -> "labelvalue1 labelvalue2 ... value"
-plist() { promq "$1" | sed -E 's/ @\[.*$//'; }
+pval() { promq "$1" | grep ' => ' | awk -F' => ' 'NR==1{split($2,a," "); print a[1]}'; }
+# "labels => value" lines only (promtool prints a blank line for an empty result)
+plist() { promq "$1" | grep ' => ' | sed -E 's/ @\[.*$//'; }
 lbl() { grep -o "$1=\"[^\"]*\"" | head -1 | cut -d'"' -f2; }
 
 if [[ "$RES_PROM" == "OK" ]]; then

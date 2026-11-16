@@ -350,7 +350,7 @@ PPOD=$(kubectl get pod -n "$PNS" -l "operator.prometheus.io/name=$PNAME" -o json
 promq() { kubectl exec -n "$PNS" "$PPOD" -c prometheus -- promtool query instant http://localhost:9090 "$1" 2>/dev/null; }
 
 RESULT=""; CANQ=0; INCONF=0
-[[ "$(promq 'vector(1)' | awk -F' => ' 'NR==1{split($2,a," "); print a[1]}')" == 1 ]] && CANQ=1
+[[ "$(promq 'vector(1)' | grep ' => ' | awk -F' => ' 'NR==1{split($2,a," "); print a[1]}')" == 1 ]] && CANQ=1
 [[ $CANQ -eq 0 ]] && warn "Cannot query Prometheus with kubectl exec (permission?) - only checking config"
 # did the operator put the Probe jobs into the Prometheus config?
 inconf() {
@@ -360,7 +360,7 @@ inconf() {
 for i in $(seq 1 18); do
         [[ $INCONF -eq 0 && "$(inconf)" -gt 0 ]] 2>/dev/null && { INCONF=1; ok "Probe jobs are in Prometheus config (selected OK)"; }
         if [[ $CANQ -eq 1 ]]; then
-                RESULT=$(promq 'probe_success{job=~"probe/.*/(coredns|rancher-health)"}' | sed -E 's/ @\[.*$//')
+                RESULT=$(promq 'probe_success{job=~"probe/.*/(coredns|rancher-health)"}' | grep ' => ' | sed -E 's/ @\[.*$//')
                 [[ -n "$RESULT" ]] && break
         elif [[ $INCONF -eq 1 ]]; then
                 break
