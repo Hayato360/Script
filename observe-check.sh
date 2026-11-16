@@ -16,6 +16,9 @@
 #   OBSERVE_HOST=metrics-gateway.olsxops.com
 #
 # Only uses: kubectl get / kubectl exec "promtool query" (a read query) / curl HEAD.
+# If kubectl is missing but a kubeconfig exists, it can download a TEMPORARY kubectl
+# to /tmp/observe-check.* (asks first, or KUBECTL_DOWNLOAD=y) and deletes it at exit.
+# RKE1 (Docker) nodes have no admin kubeconfig -> run from the Rancher VM instead.
 #############################################################################
 
 PATH=$PATH:/var/lib/rancher/rke2/bin:/usr/local/bin
@@ -48,17 +51,65 @@ echo -e "${CYAN}################################################################
 #############################################################
 step "1. Cluster access"
 #############################################################
-command -v kubectl >/dev/null 2>&1 || { bad "kubectl not found"; exit 1; }
+# --- what kind of node is this? --------------------------------------------------
+KIND=""
+if [[ -x /var/lib/rancher/rke2/bin/kubectl || -f /etc/rancher/rke2/rke2.yaml ]]; then KIND=RKE2
+elif command -v k3s >/dev/null 2>&1; then KIND=K3S
+elif command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx kubelet; then KIND=RKE1
+fi
+[[ -n "$KIND" ]] && info "Node type: $KIND"
 
+# --- kubeconfig -------------------------------------------------------------------
 if [[ -z "$KUBECONFIG" ]]; then
-        for f in /etc/rancher/rke2/rke2.yaml "$HOME/.kube/config" /root/.kube/kubeconfig /root/.kube/config; do
+        for f in /etc/rancher/rke2/rke2.yaml /etc/rancher/k3s/k3s.yaml "$HOME/.kube/config" /root/.kube/kubeconfig /root/.kube/config \
+                 /root/kube_config_*.yml /home/*/kube_config_*.yml /home/*/.kube/config; do
                 if [[ -r "$f" ]]; then export KUBECONFIG=$f; break; fi
         done
+fi
+
+# --- kubectl ----------------------------------------------------------------------
+TMPK=""
+cleanup() { [[ -n "$TMPK" ]] && rm -rf "$TMPK"; }
+trap cleanup EXIT
+if ! command -v kubectl >/dev/null 2>&1; then
+        if [[ "$KIND" == K3S ]]; then
+                kubectl() { k3s kubectl "$@"; }
+                info "Using 'k3s kubectl'"
+        elif [[ -z "$KUBECONFIG" ]]; then
+                bad "kubectl not found and no kubeconfig on this machine"
+                if [[ "$KIND" == RKE1 ]]; then
+                        info "This is an RKE1 (Docker) node: it has no admin kubeconfig."
+                fi
+                info "Run it where a kubeconfig of this cluster exists, e.g. the Rancher VM:"
+                info "  Rancher UI > cluster > Download KubeConfig > save as /root/.kube/<cluster>.yaml"
+                info "  KUBECONFIG=/root/.kube/<cluster>.yaml bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/observe-check.sh)"
+                info "Or copy that kubeconfig to this node as /root/.kube/config and run again."
+                exit 1
+        else
+                warn "kubectl not found, but kubeconfig $KUBECONFIG exists"
+                if [[ "${KUBECTL_DOWNLOAD:-}" != y ]]; then
+                        read -r -p "         Download a TEMPORARY kubectl to /tmp (deleted when the script ends)? [y/N]: " KUBECTL_DOWNLOAD
+                fi
+                if [[ "$KUBECTL_DOWNLOAD" =~ ^[Yy]$ ]]; then
+                        TMPK=$(mktemp -d /tmp/observe-check.XXXXXX)
+                        KV=$(curl -sL -m 15 https://dl.k8s.io/release/stable.txt)
+                        ARCH=$(uname -m); [[ "$ARCH" == aarch64 ]] && ARCH=arm64 || ARCH=amd64
+                        if [[ "$KV" == v* ]] && curl -sL -m 120 -o "$TMPK/kubectl" "https://dl.k8s.io/release/$KV/bin/linux/$ARCH/kubectl" && chmod +x "$TMPK/kubectl" && "$TMPK/kubectl" version --client >/dev/null 2>&1; then
+                                PATH=$TMPK:$PATH
+                                ok "Temporary kubectl $KV in $TMPK (removed at exit)"
+                        else
+                                bad "Could not download kubectl (no internet?)"; exit 1
+                        fi
+                else
+                        bad "kubectl not found"; exit 1
+                fi
+        fi
 fi
 info "KUBECONFIG = ${KUBECONFIG:-(kubectl default)}"
 
 if ! kubectl get nodes >/dev/null 2>&1; then
-        bad "Cannot reach the cluster (check KUBECONFIG / run as root on a master)"
+        bad "Cannot reach the cluster with this kubeconfig"
+        kubectl get nodes 2>&1 | head -3 | sed 's/^/         /'
         exit 1
 fi
 NODES=$(kubectl get nodes --no-headers 2>/dev/null | wc -l)
