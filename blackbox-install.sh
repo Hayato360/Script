@@ -8,6 +8,8 @@
 #   1. Helm chart prometheus-community/prometheus-blackbox-exporter  (ns blackbox)
 #   2. Probe 01-coredns         (dns_udp  -> cluster DNS service)
 #   3. Probe 02-rancher-health  (http_2xx -> <Rancher URL>/healthz)
+#   4. If the Cert remoteWrite keep regex has no probe_, offers to change it to
+#      "<old>|probe_.*" (e.g. x509_.*|probe_.*) with kubectl patch (backup saved)
 #   (no TCP probe - 03-rancher-tcp-probe is skipped on purpose)
 #
 # Run on : a master node or the Rancher VM, as root, with kubeconfig of the cluster
@@ -150,15 +152,31 @@ OTHER_SEL=$(pjp '{.spec.probeSelector.matchLabels}' | grep -o '"[^"]*":' | tr -d
 
 # remoteWrite from Cert setup
 RW_URL=$(pjp '{.spec.remoteWrite[*].url}')
-RW_KEEP=$(pjp '{.spec.remoteWrite[*].writeRelabelConfigs[?(@.action=="keep")].regex}')
-RW_CLUSTER=$(pjp '{.spec.remoteWrite[*].writeRelabelConfigs[?(@.targetLabel=="cluster")].replacement}' | awk '{print $1}')
+# find the OLS Observe remoteWrite entry and its "keep" rule index
+RW_IDX=""; KEEP_IDX=""; RW_KEEP=""; FIX_REGEX=""
+i=0
+while read -r u; do
+        [[ "$u" == *metrics-gateway.olsxops.com* ]] && { RW_IDX=$i; break; }
+        i=$((i+1))
+done < <(pjp '{range .spec.remoteWrite[*]}{.url}{"\n"}{end}')
+if [[ -n "$RW_IDX" ]]; then
+        k=0
+        while read -r a; do
+                [[ "${a,,}" == keep ]] && { KEEP_IDX=$k; break; }
+                k=$((k+1))
+        done < <(pjp "{range .spec.remoteWrite[$RW_IDX].writeRelabelConfigs[*]}{.action}{\"\n\"}{end}")
+        [[ -n "$KEEP_IDX" ]] && RW_KEEP=$(pjp "{.spec.remoteWrite[$RW_IDX].writeRelabelConfigs[$KEEP_IDX].regex}")
+fi
+RW_CLUSTER=$(pjp "{.spec.remoteWrite[${RW_IDX:-0}].writeRelabelConfigs[?(@.targetLabel==\"cluster\")].replacement}" | awk '{print $1}')
 if [[ -z "$RW_URL" ]]; then
         warn "No remoteWrite on Prometheus -> probe results stay local only (Cert setup not done?)"
+elif [[ -z "$RW_IDX" ]]; then
+        warn "No remoteWrite to metrics-gateway.olsxops.com (found: $RW_URL) -> probe results not sent to Observe"
 else
-        ok "remoteWrite: $RW_URL"
+        ok "remoteWrite[$RW_IDX]: $(pjp "{.spec.remoteWrite[$RW_IDX].url}")"
         if [[ -n "$RW_KEEP" && "$RW_KEEP" != *probe_* ]]; then
                 warn "remoteWrite keep regex is '$RW_KEEP' -> probe_* is NOT sent to Observe"
-                info "Add probe_ to it later, e.g. regex: \"x509_.*|probe_.*\" (this script does not edit Prometheus)"
+                FIX_REGEX="$RW_KEEP|probe_.*"
         else
                 ok "keep regex includes probe_ (${RW_KEEP:-no filter})"
         fi
@@ -234,6 +252,16 @@ else
 fi
 info "02-rancher-health : http_2xx -> $RANCHER_URL/healthz"
 info "03-rancher-tcp    : skipped"
+if [[ -n "$FIX_REGEX" ]]; then
+        echo ""
+        warn "remoteWrite only sends '$RW_KEEP' -> blackbox results will NOT reach Observe"
+        ask FIX_KEEP "Change keep regex to '$FIX_REGEX' (as in the manual)? y/n" "y"
+        if [[ "$FIX_KEEP" =~ ^[Yy]$ ]]; then
+                info "remoteWrite keep : '$RW_KEEP' -> '$FIX_REGEX'  (kubectl patch, tenant header unchanged)"
+        else
+                FIX_REGEX=""; info "remoteWrite keep : unchanged (probe_* stays local)"
+        fi
+fi
 info "Files saved in    : $WORKDIR"
 echo ""
 if [[ "$ASSUME_YES" != y ]]; then
@@ -341,6 +369,25 @@ fi
 probe_yaml rancher-health http_2xx "$RANCHER_URL/healthz" monitoring > "$WORKDIR/02-rancher-health-probe.yaml"
 kubectl apply -f "$WORKDIR/02-rancher-health-probe.yaml" || fail "apply 02-rancher-health-probe.yaml failed"
 kubectl get probes.monitoring.coreos.com -n "$PROBE_NS"
+
+if [[ -n "$FIX_REGEX" ]]; then
+        RPATH="/spec/remoteWrite/$RW_IDX/writeRelabelConfigs/$KEEP_IDX/regex"
+        # "test" op = only change if the value is still exactly the old one
+        PATCH=$(printf '[{"op":"test","path":"%s","value":"%s"},{"op":"replace","path":"%s","value":"%s"}]' \
+                "$RPATH" "${RW_KEEP//\\/\\\\}" "$RPATH" "${FIX_REGEX//\\/\\\\}")
+        kubectl get prometheus -n "$PNS" "$PNAME" -o yaml > "$WORKDIR/prometheus-$PNAME.backup.yaml" 2>/dev/null
+        if kubectl patch prometheus -n "$PNS" "$PNAME" --type=json -p="$PATCH"; then
+                ok "keep regex now: $(pjp "{.spec.remoteWrite[$RW_IDX].writeRelabelConfigs[$KEEP_IDX].regex}")"
+                info "backup: $WORKDIR/prometheus-$PNAME.backup.yaml"
+                case "$PNAME" in rancher-monitoring-*|kube-prometheus-stack-*)
+                        warn "Prometheus is Helm-managed: also put this regex in the app values"
+                        info "(Rancher > Apps > Installed Apps > ${PNAME%-prometheus} > Edit YAML > prometheus.prometheusSpec.remoteWrite)"
+                        info "or the next upgrade of the monitoring app reverts it" ;;
+                esac
+        else
+                warn "Patch not applied (regex changed meanwhile?) - edit manually: kubectl edit prometheus -n $PNS $PNAME"
+        fi
+fi
 
 #############################################################
 step "6. Verify (waiting up to 2 min for first probe results)"
