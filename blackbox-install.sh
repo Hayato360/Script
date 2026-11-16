@@ -14,6 +14,8 @@
 #        (tenant rancher-health, keep probe_.*, same secret, cluster + public_ip labels)
 #      asks first, kubectl patch, backup saved in WORKDIR
 #   (no TCP probe - 03-rancher-tcp-probe is skipped on purpose)
+#   If Blackbox is already installed, it offers "remoteWrite only" mode: keeps the existing
+#   exporter + Probes untouched and only does step 4 (RW_ONLY=y / n to force a new install)
 #
 # Run on : a master node or the Rancher VM, as root, with kubeconfig of the cluster
 # Usage  : bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/blackbox-install.sh)
@@ -205,8 +207,16 @@ else
         [[ -z "$RW_UNAME" ]] && { warn "Existing remoteWrite has no basicAuth secret - cannot copy it, add the entry manually"; ADD_ENTRY=""; }
 fi
 
-EXIST=$(kubectl get deploy -A --no-headers 2>/dev/null | grep -i blackbox | grep -v "^$BB_NS[[:space:]]*$BB_RELEASE-")
-[[ -n "$EXIST" ]] && { warn "Another blackbox exporter already exists:"; echo "$EXIST" | sed 's/^/           /'; }
+# Blackbox already installed (e.g. by hand from the manual)? -> offer remoteWrite-only mode
+ONLY_RW=""
+ANY_BB=$(kubectl get deploy -A --no-headers 2>/dev/null | grep -i blackbox)
+if [[ -n "$ANY_BB" ]]; then
+        ok "Blackbox exporter already installed:"
+        echo "$ANY_BB" | awk '{printf "           %s/%s  %s\n",$1,$2,$3}'
+        info "Existing Probes: $(kubectl get probes.monitoring.coreos.com -A --no-headers 2>/dev/null | awk '{printf "%s/%s ",$1,$2}')"
+        ask RW_ONLY "Keep existing Blackbox + Probes and ONLY fix remoteWrite (no helm, no probe changes)? y/n" "y"
+        [[ "$RW_ONLY" =~ ^[Yy]$ ]] && ONLY_RW=y
+fi
 
 #############################################################
 step "3. Settings"
@@ -229,10 +239,12 @@ echo "  ------------------------------------------------------------------------
 echo "  1) Cluster name : label cluster= on the probes, shown in Grafana (no spaces)"
 echo "                    should match the Cert remoteWrite cluster label${RW_CLUSTER:+ (found: $RW_CLUSTER)}"
 echo "                    e.g. ranchy, urbanway, LppRiceMill, dentcot"
+if [[ -z "$ONLY_RW" ]]; then
 echo "  2) Rancher URL  : Rancher server of this customer, probed as <URL>/healthz"
 echo "                    e.g. https://ranchy.openlandscape.cloud${DEF_URL:+   (found: $DEF_URL)}"
 echo "  3) DNS target   : cluster DNS service:port for the CoreDNS probe"
 echo "                    RKE2 = rke2-coredns-rke2-coredns..., RKE1 = kube-dns...${DNS_SVC:+   (found: $DNS_SVC)}"
+fi
 echo "  ---------------------------------------------------------------------------------"
 
 while :; do
@@ -242,6 +254,7 @@ while :; do
 done
 [[ -n "$RW_CLUSTER" && "$CLUSTER_NAME" != "$RW_CLUSTER" ]] && warn "Differs from Cert remoteWrite label '$RW_CLUSTER' (remoteWrite will overwrite it to '$RW_CLUSTER' in Observe)"
 
+if [[ -z "$ONLY_RW" ]]; then
 while :; do
         ask RANCHER_URL "2) Rancher URL" "$DEF_URL"
         RANCHER_URL=${RANCHER_URL%/}; RANCHER_URL=${RANCHER_URL%/healthz}
@@ -257,14 +270,18 @@ DEF_DNS=""; [[ -n "$DNS_SVC" ]] && DEF_DNS="$DNS_SVC.kube-system.svc.$DNS_DOMAIN
 ask DNS_TARGET "3) DNS target (type 'skip' for no DNS probe)" "${DEF_DNS:-skip}"
 [[ "$DNS_TARGET" == skip ]] && DNS_TARGET=""
 [[ -n "$DNS_TARGET" && "$DNS_TARGET" != *:* ]] && DNS_TARGET="$DNS_TARGET:53"
+fi
 
 BB_SVC="$BB_RELEASE-prometheus-blackbox-exporter"
 [[ "$BB_RELEASE" == *prometheus-blackbox-exporter* ]] && BB_SVC=$BB_RELEASE
 PROBER="$BB_SVC.$BB_NS.svc:9115"
 
 echo ""
-echo -e "  ${bold}Plan${normal}   (you filled: cluster, Rancher URL, DNS target - the rest is auto-detected)"
+echo -e "  ${bold}Plan${normal}"
 info "Cluster           : $CLUSTER_NAME   (k8s $K8SVER)"
+if [[ -n "$ONLY_RW" ]]; then
+        info "Blackbox + Probes : existing ones kept, NOT changed"
+else
 info "Helm release      : $BB_RELEASE in ns $BB_NS  (chart ${BB_CHART_VERSION:-latest})"
 info "Prober URL        : $PROBER"
 info "Probes namespace  : $PROBE_NS   label release=$PROBE_RELEASE_LABEL"
@@ -275,6 +292,7 @@ else
 fi
 info "02-rancher-health : http_2xx -> $RANCHER_URL/healthz"
 info "03-rancher-tcp    : skipped"
+fi
 if [[ -n "$FIX_REGEX" ]]; then
         echo ""
         warn "remoteWrite[$FIX_IDX] (tenant $BB_TENANT) only sends '$RW_KEEP' -> blackbox results will NOT reach Observe"
@@ -302,15 +320,20 @@ if [[ -n "$ADD_ENTRY" ]]; then
 fi
 info "Files saved in    : $WORKDIR"
 echo ""
+if [[ -n "$ONLY_RW" && -z "$FIX_REGEX" && -z "$ADD_ENTRY" ]]; then
+        ok "Nothing to change - Blackbox exists and probe_* already goes to tenant $BB_TENANT"
+        exit 0
+fi
 if [[ "$ASSUME_YES" != y ]]; then
-        read -r -p "  Install now? [y/N]: " GO
+        read -r -p "  Apply now? [y/N]: " GO
         [[ "$GO" =~ ^[Yy]$ ]] || { echo "  Cancelled - nothing changed."; exit 0; }
 fi
+mkdir -p "$WORKDIR"
 
+if [[ -z "$ONLY_RW" ]]; then
 #############################################################
 step "4. Helm install blackbox exporter"
 #############################################################
-mkdir -p "$WORKDIR"
 cat > "$WORKDIR/blackbox.values.yaml" <<'EOF'
 config:
   modules:
@@ -407,7 +430,11 @@ fi
 probe_yaml rancher-health http_2xx "$RANCHER_URL/healthz" monitoring > "$WORKDIR/02-rancher-health-probe.yaml"
 kubectl apply -f "$WORKDIR/02-rancher-health-probe.yaml" || fail "apply 02-rancher-health-probe.yaml failed"
 kubectl get probes.monitoring.coreos.com -n "$PROBE_NS"
+else
+step "4-5. Skipped helm + probes (existing Blackbox kept)"
+fi
 
+step "5b. remoteWrite to OLS Observe"
 PATCHED=""
 if [[ -n "$FIX_REGEX" || -n "$ADD_ENTRY" ]]; then
         kubectl get prometheus -n "$PNS" "$PNAME" -o yaml > "$WORKDIR/prometheus-$PNAME.backup.yaml" 2>/dev/null
@@ -454,7 +481,7 @@ RESULT=""; CANQ=0; INCONF=0
 # did the operator put the Probe jobs into the Prometheus config?
 inconf() {
         kubectl get secret -n "$PNS" "prometheus-$PNAME" -o jsonpath='{.data.prometheus\.yaml\.gz}' 2>/dev/null \
-                | base64 -d 2>/dev/null | gunzip 2>/dev/null | grep -c "job_name: probe/$PROBE_NS/"
+                | base64 -d 2>/dev/null | gunzip 2>/dev/null | grep -c "job_name: probe/"
 }
 for i in $(seq 1 18); do
         [[ $INCONF -eq 0 && "$(inconf)" -gt 0 ]] 2>/dev/null && { INCONF=1; ok "Probe jobs are in Prometheus config (selected OK)"; }
