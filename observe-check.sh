@@ -196,6 +196,15 @@ if [[ "$RES_PROM" == "OK" ]]; then
         if [[ "$(pval 'vector(1)')" == "1" ]]; then
                 QMODE=promtool
                 ok "Can query Prometheus (promtool)"
+                RELOAD_OK=$(pval 'prometheus_config_last_reload_successful')
+                if [[ "$RELOAD_OK" == 0 ]]; then
+                        bad "Prometheus config reload FAILED -> runs on an OLD config (new remoteWrite/scrape jobs not active)"
+                        info "see: kubectl logs -n $PNS $PPOD -c prometheus --tail=300 | grep -iE 'error loading config|reload'"
+                        PROM_DEGRADED="config reload failed"
+                fi
+                RST=$(kubectl get pod -n "$PNS" "$PPOD" -o jsonpath='{.status.containerStatuses[?(@.name=="prometheus")].restartCount}' 2>/dev/null)
+                RSN=$(kubectl get pod -n "$PNS" "$PPOD" -o jsonpath='{.status.containerStatuses[?(@.name=="prometheus")].lastState.terminated.reason}' 2>/dev/null)
+                [[ -n "$RST" && "$RST" -gt 0 ]] 2>/dev/null && warn "prometheus container restarts=$RST${RSN:+ (last: $RSN)}"
         else
                 warn "Cannot run promtool query in $PPOD (no exec permission?) - metric checks skipped"
         fi
