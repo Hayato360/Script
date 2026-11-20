@@ -38,3 +38,12 @@ Asks only: name, cluster, public_ip. Creates secret mimir-auth if missing (asks 
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/observe-remotewrite.sh)
 ```
+
+## Cert monitoring (x509-certificate-exporter + remoteWrite tenant rancher-cert)
+
+Installs enix/x509-certificate-exporter on control-plane nodes + ServiceMonitor, and adds
+remoteWrite "<cluster>-cert" (tenant rancher-cert, keep x509_.*) for the Certificate Monitoring dashboard.
+
+```bash
+bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/cert-install.sh)
+```
