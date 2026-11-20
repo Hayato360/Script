@@ -21,8 +21,8 @@
 #           replacement: "<PUBLIC_IP>"        <- asked
 #           targetLabel: public_ip
 #
-# If secret mimir-auth is missing it is created with the manual's Mimir login
-# (override: MIMIR_USER=... MIMIR_PASS=...).
+# If secret mimir-auth is missing it is created: username default mimiradmin,
+# password is asked (hidden). Env: MIMIR_USER=... MIMIR_PASS=... skips the questions.
 # Existing remoteWrite entries (e.g. INET o11y-metrics) are kept, the new one is appended.
 # Uses kubectl patch (no editor), saves a backup first, then checks that it is sending.
 #
@@ -203,9 +203,9 @@ if kubectl get secret -n "$PNS" "$SECRET" >/dev/null 2>&1; then
         ok "Secret $PNS/$SECRET exists (username/password)"
 else
         warn "Secret $PNS/$SECRET not found -> will create it (manual step 'Create Secret')"
-        # OLS Mimir basic-auth from the manual (override with MIMIR_USER / MIMIR_PASS env)
-        MIMIR_USER=${MIMIR_USER:-mimiradmin}
-        MIMIR_PASS=${MIMIR_PASS:-kube@olsCl0ud}
+        # OLS Mimir basic-auth (manual 'Create Secret'): username prefilled, password typed (hidden)
+        ask MIMIR_USER "Mimir username" "mimiradmin"
+        while [[ -z "$MIMIR_PASS" ]]; do read -r -s -p "  Mimir password (hidden, see manual 'Create Secret'): " MIMIR_PASS; echo ""; done
         NEED_SECRET=1
 fi
 
