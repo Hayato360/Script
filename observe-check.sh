@@ -306,8 +306,9 @@ else
                                 SENT=$(pval "sum(rate(prometheus_remote_storage_samples_total{url=~\".*$OBSERVE_HOST.*\"}[5m]))")
                                 FAILR=$(pval "sum(rate(prometheus_remote_storage_samples_failed_total{url=~\".*$OBSERVE_HOST.*\"}[5m]))")
                                 LAG=$(pval "max(time() - prometheus_remote_storage_queue_highest_sent_timestamp_seconds{url=~\".*$OBSERVE_HOST.*\"})")
-                                [[ -n "$LAG" ]] && awk "BEGIN{exit !($LAG > 1000000000)}" && LAG="never"
-                                info "sent=${SENT:-0}/s  failed=${FAILR:-0}/s  last-sent-lag=${LAG:-?}${LAG:+s}"
+                                if [[ -n "$LAG" ]] && awk "BEGIN{exit !($LAG > 1000000000)}"; then LAG="never"
+                                elif [[ -n "$LAG" ]]; then LAG="${LAG%.*}s"; fi
+                                info "sent=${SENT:-0}/s  failed=${FAILR:-0}/s  last-sent-lag=${LAG:-?}"
                                 if [[ -z "$SENT" ]] || awk "BEGIN{exit !(${SENT:-0} <= 0)}"; then
                                         HAVE=$(pval 'count({__name__=~"x509_.*|probe_.*"})')
                                         if [[ -z "$HAVE" ]]; then
