@@ -306,9 +306,16 @@ else
                                 SENT=$(pval "sum(rate(prometheus_remote_storage_samples_total{url=~\".*$OBSERVE_HOST.*\"}[5m]))")
                                 FAILR=$(pval "sum(rate(prometheus_remote_storage_samples_failed_total{url=~\".*$OBSERVE_HOST.*\"}[5m]))")
                                 LAG=$(pval "max(time() - prometheus_remote_storage_queue_highest_sent_timestamp_seconds{url=~\".*$OBSERVE_HOST.*\"})")
-                                info "sent=${SENT:-0}/s  failed=${FAILR:-0}/s  last-sent-lag=${LAG:-?}s"
+                                [[ -n "$LAG" ]] && awk "BEGIN{exit !($LAG > 1000000000)}" && LAG="never"
+                                info "sent=${SENT:-0}/s  failed=${FAILR:-0}/s  last-sent-lag=${LAG:-?}${LAG:+s}"
                                 if [[ -z "$SENT" ]] || awk "BEGIN{exit !(${SENT:-0} <= 0)}"; then
-                                        bad "Nothing sent to $OBSERVE_HOST in last 5m"; RW_OK=0
+                                        HAVE=$(pval 'count({__name__=~"x509_.*|probe_.*"})')
+                                        if [[ -z "$HAVE" ]]; then
+                                                warn "Nothing to send yet: this cluster has no x509_* / probe_* metrics (install Cert exporter / Blackbox first)"
+                                                RW_IDLE=1
+                                        else
+                                                bad "Nothing sent to $OBSERVE_HOST in last 5m (but $HAVE x509_/probe_ series exist -> reload/auth/egress problem)"; RW_OK=0
+                                        fi
                                 elif [[ -n "$FAILR" ]] && awk "BEGIN{exit !($FAILR > 0)}"; then
                                         bad "Remote write has failures (auth 401/403? network?) - check: kubectl logs -n $PNS $PPOD -c prometheus | grep -i remote"; RW_OK=0
                                 elif [[ -n "$LAG" ]] && awk "BEGIN{exit !($LAG > 300)}"; then
@@ -317,7 +324,9 @@ else
                                         ok "Remote write is sending without failures"
                                 fi
                         fi
-                        if [[ $RW_OK -eq 1 ]]; then RES_RW="OK"; else RES_RW="FAIL"; NOTE_RW="remoteWrite ส่งไม่ได้"; fi
+                        if [[ $RW_OK -eq 1 && -n "$RW_IDLE" ]]; then RES_RW="OK"; NOTE_RW="ตั้งค่าถูก แต่ยังไม่มี x509/probe metrics ให้ส่ง"
+                        elif [[ $RW_OK -eq 1 ]]; then RES_RW="OK"
+                        else RES_RW="FAIL"; NOTE_RW="remoteWrite ส่งไม่ได้"; fi
                 fi
         fi
 fi
