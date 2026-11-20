@@ -165,6 +165,17 @@ else
                         RES_PROM="FAIL"; NOTE_PROM="Prometheus pod not ready"
                 fi
 
+                # operator view: Available / Reconciled conditions (catches config-reload problems)
+                for ct in Available Reconciled; do
+                        cs=$(kubectl get prometheus -n "$PNS" "$PNAME" -o jsonpath="{.status.conditions[?(@.type==\"$ct\")].status}" 2>/dev/null)
+                        [[ -z "$cs" || "$cs" == True ]] && continue
+                        cm=$(kubectl get prometheus -n "$PNS" "$PNAME" -o jsonpath="{.status.conditions[?(@.type==\"$ct\")].reason}: {.status.conditions[?(@.type==\"$ct\")].message}" 2>/dev/null)
+                        bad "Prometheus $ct=$cs  ${cm:0:300}"
+                        PROM_DEGRADED="Prometheus $ct=$cs (see reason above)"
+                done
+                NRC=$(kubectl get pod -n "$PNS" "$PPOD" -o jsonpath='{range .status.containerStatuses[*]}{.name}={.ready} {end}' 2>/dev/null)
+                [[ "$NRC" == *=false* ]] && warn "Containers not ready: $NRC"
+
                 PVC=$(kubectl get pvc -n "$PNS" --no-headers 2>/dev/null | grep "prometheus-$PNAME" | awk '{print $1" "$2" "$4" "$6}')
                 [[ -n "$PVC" ]] && info "PVC: $PVC" || warn "Prometheus has no PVC (data lost on restart)"
         fi
@@ -447,6 +458,7 @@ fi
 [[ $BB_OK -eq 1 ]] && RES_BB="OK" || RES_BB="FAIL"
 
 #############################################################
+[[ -n "$PROM_DEGRADED" ]] && { RES_PROM="FAIL"; NOTE_PROM=$PROM_DEGRADED; }
 FIRSTNODE=$(kubectl get nodes --no-headers 2>/dev/null | awk 'NR==1{print $1}')
 step "Summary  (run on $(hostname), cluster: ${RW_CLUSTER:-$FIRSTNODE ...}, $NODES nodes)"
 #############################################################
