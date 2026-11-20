@@ -237,12 +237,22 @@ else
                         for ((j=0; j<NRW; j++)); do
                                 pj() { kubectl get prometheus -n "$PNS" "$PNAME" -o jsonpath="{.spec.remoteWrite[$j]$1}" 2>/dev/null; }
                                 [[ "$(pj '.url')" == *"$OBSERVE_HOST"* ]] || continue
+                                jn=$(pj '.name')
                                 jt=$(pj '.headers.X-Scope-OrgID')
                                 jk=$(pj '.writeRelabelConfigs[?(@.action=="keep")].regex')
-                                [[ $j -ne $IDX ]] && info "remoteWrite[$j] name=$(pj '.name') tenant=${jt:-none} keep=${jk:-<all>}"
+                                js=""
+                                if [[ "$QMODE" == promtool && -n "$jn" ]]; then
+                                        js=$(pval "sum(rate(prometheus_remote_storage_samples_total{remote_name=\"$jn\"}[5m]))")
+                                fi
+                                info "remoteWrite[$j] name=$jn tenant=${jt:-none} keep=${jk:-<all>}  sent=${js:-0}/s"
                                 [[ -z "$jk" || "$jk" == *x509_* ]] && X509_PUSH=1
                                 if [[ -z "$jk" || "$jk" == *probe_* ]]; then
-                                        if [[ "$jt" == "$BB_TENANT" ]]; then PROBE_PUSH=1; else PROBE_OTHER=${jt:-none}; fi
+                                        if [[ "$jt" == "$BB_TENANT" ]]; then
+                                                PROBE_PUSH=1
+                                                if [[ "$QMODE" == promtool ]] && { [[ -z "$js" ]] || awk "BEGIN{exit !($js <= 0)}"; }; then
+                                                        warn "$jn is configured but NOT sending yet (Prometheus reloads config in 1-3 min - re-run later)"
+                                                fi
+                                        else PROBE_OTHER=${jt:-none}; fi
                                 fi
                         done
                         [[ $X509_PUSH -eq 1 ]] || warn "No remoteWrite keeps x509_ -> cert metrics NOT pushed"
