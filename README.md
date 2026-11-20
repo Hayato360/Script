@@ -29,3 +29,12 @@ Asks you for: cluster name, Rancher URL, DNS target. Everything else is auto-det
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/blackbox-install.sh)
 ```
+
+## Add cluster to OLS Observe (remoteWrite, manual step "edit by kubectl")
+
+Appends the manual's remoteWrite block (tenant rancher-health, regex x509_.*|probe_.*).
+Asks only: name, cluster, public_ip. Creates secret mimir-auth if missing (asks user/password).
+
+```bash
+bash <(curl -s https://raw.githubusercontent.com/Hayato360/Script/refs/heads/main/observe-remotewrite.sh)
+```
